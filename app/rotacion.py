@@ -16,7 +16,7 @@ La fecha SIEMPRE sale de DOCUM.DOC_FECEMI a traves de DCC_CLAVE_, porque
 DCC_FECHA_ esta vacio en la enorme mayoria de los renglones.
 
 --------------------------------------------------------------------------
-DOS DECISIONES QUE NO SON MECANICAS. Ver el detalle mas abajo:
+TRES DECISIONES QUE NO SON MECANICAS. Ver el detalle mas abajo:
 
   1. Los remitos internos (RI). El PRG original define DOS VECES el
      procedimiento ProcesarFuente, con criterios opuestos, y VFP usa el
@@ -24,6 +24,10 @@ DOS DECISIONES QUE NO SON MECANICAS. Ver el detalle mas abajo:
 
   2. El ancho de ROT_ARTIC. El PRG lo fija en C(7) a mano; aca se toma del
      dato real para no truncar claves en silencio.
+
+  3. El perfil estacional (ROT_EST01..ROT_EST12 + ROT_ESTHIS). No existe en
+     el PRG: es lo que permite que el calculo de compra tenga en cuenta las
+     temporadas. Ver `_estadisticas`.
 --------------------------------------------------------------------------
 """
 
@@ -82,6 +86,10 @@ TIPOS_NEGATIVOS = {"NC", "CE"}
 # numeros NO coincidan con los que produce el ERP hoy.
 TIPO_REMITO_INTERNO = "RI"
 
+# Meses del principio de la ventana que se usan para saber si un articulo ya
+# existia o es nuevo. No entran al perfil estacional: ver `_estadisticas`.
+MESES_SONDEO = 3
+
 
 @dataclass
 class OpcionesRotacion:
@@ -94,6 +102,9 @@ class OpcionesRotacion:
     incluir_pendrive: bool = True        # tlNegro
     incluir_remoto: bool = True          # tlRemoto
     remitos_internos_son_venta: bool = False
+    # Fecha de referencia para la ventana. None = hoy. Se fija en las
+    # pruebas para que no dependan del dia en que se corren.
+    hoy: datetime.date | None = None
 
     def tipos_documento(self) -> set[str]:
         tipos = set(TIPOS_BASE)
@@ -196,7 +207,7 @@ class CalculadorRotacion:
             resultado.mensaje = "\n".join(problemas)
             return resultado
 
-        desde, hasta = self.ventana()
+        desde, hasta = self.ventana(self.o.hoy)
         resultado.desde, resultado.hasta = desde, hasta
         sucursal = alltrim(self.p.sucursal)
 
@@ -627,7 +638,51 @@ class CalculadorRotacion:
             else:
                 mediana = (ordenados[meses // 2 - 1] + ordenados[meses // 2]) / 2
 
-            filas.append({
+            # --- Perfil estacional ------------------------------------
+            # Venta PROMEDIO de cada mes calendario (enero..diciembre), para
+            # que el calculo de compra sepa que meses vienen fuertes y cuales
+            # flojos.
+            #
+            # DESDE CUANDO se cuenta:
+            #   Los primeros MESES_SONDEO meses de la ventana se usan SOLO
+            #   para decidir si el articulo ya existia, y NO entran al
+            #   perfil:
+            #   - Vendio en alguno de ellos: ya existia. El perfil arranca
+            #     despues del sondeo y los meses en cero son temporada baja
+            #     de verdad.
+            #   - No vendio: es nuevo. Los meses anteriores no son
+            #     "temporada baja", son meses en los que no existia. El
+            #     perfil arranca el mes SIGUIENTE a la primera venta.
+            #
+            #   POR QUE NO SE USA EL MES QUE DECIDE: ese mes tiene venta por
+            #   definicion. Si entrara al perfil, en los articulos de poca
+            #   venta ese mes del anio saldria inflado y apareceria una
+            #   "temporada" que no existe. Se comprobo con datos de venta
+            #   pareja: incluyendolo, septiembre a noviembre daban el doble.
+            #
+            # ROT_ESTHIS guarda cuantos meses de historia tiene el perfil.
+            # Con menos de 12 no estan todos los meses del anio y el calculo
+            # de compra no usa el perfil propio del articulo (cae al rubro).
+            # Por eso la estacionalidad necesita recalcular con 15 meses o
+            # mas (el valor por defecto es 24).
+            primer_mes = next(i for i, balde in enumerate(acotados) if balde > 0)
+            if primer_mes < MESES_SONDEO:
+                inicio = MESES_SONDEO
+            else:
+                inicio = primer_mes + 1
+            historia = max(meses - inicio, 0)
+            suma_mes = [0.0] * 12
+            veces_mes = [0] * 12
+            for indice in range(inicio, meses):
+                calendario = (mes_ini - 1 + indice) % 12     # 0 = enero
+                suma_mes[calendario] += acotados[indice]
+                veces_mes[calendario] += 1
+            perfil = [
+                suma_mes[m] / veces_mes[m] if veces_mes[m] else 0.0
+                for m in range(12)
+            ]
+
+            fila = {
                 "ROT_ARTIC": articulo,
                 "ROT_ORIGE": origen,
                 "ROT_DESDE": desde,
@@ -642,7 +697,11 @@ class CalculadorRotacion:
                 "ROT_ULTVTA": ultima,
                 "ROT_NEGRO": negro,
                 "ROT_FECCAL": hoy,
-            })
+                "ROT_ESTHIS": historia,
+            }
+            for m in range(12):
+                fila[f"ROT_EST{m + 1:02d}"] = perfil[m]
+            filas.append(fila)
 
         # Mismo orden que dejaba el INDEX ON ROT_ARTIC + ROT_ORIGE
         filas.sort(key=lambda f: (f["ROT_ARTIC"], f["ROT_ORIGE"]))
@@ -668,7 +727,11 @@ class CalculadorRotacion:
             ("ROT_ULTVTA", "D", 8, 0),
             ("ROT_NEGRO", "L", 1, 0),
             ("ROT_FECCAL", "D", 8, 0),
-        ]
+            # Perfil estacional: meses de historia + venta promedio de cada
+            # mes calendario (01 = enero ... 12 = diciembre). Van al final
+            # para no mover ninguna columna que ya existia.
+            ("ROT_ESTHIS", "N", 4, 0),
+        ] + [(f"ROT_EST{m:02d}", "N", 12, 3) for m in range(1, 13)]
 
     # -- validacion contra ARTICULO ----------------------------------------
 
@@ -732,8 +795,22 @@ class CalculadorRotacion:
                 f"{resultado.unidades_por_origen[origen]:>18,.3f} unidades"
             )
 
+        # Cuantas filas tienen perfil estacional completo (12+ meses de
+        # historia). Las demas usan el perfil de su rubro al calcular la compra.
+        con_perfil = sum(1 for fila in filas if fila["ROT_ESTHIS"] >= 12)
+
         self._inf()
         self._inf(f"  Filas totales en ROTACION.DBF : {resultado.filas:,}")
+        self._inf(
+            f"  Con perfil estacional propio (12+ meses de historia) : "
+            f"{con_perfil:,}"
+        )
+        if self.o.meses < 12 + MESES_SONDEO:
+            self._inf(
+                f"    ATENCION: con menos de {12 + MESES_SONDEO} meses de "
+                "ventana ningun articulo puede tener perfil estacional propio. "
+                "Conviene recalcular con 24."
+            )
         porcentaje = (
             resultado.enganchan_con_articulo / resultado.filas * 100
             if resultado.filas else 0.0

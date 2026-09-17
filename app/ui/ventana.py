@@ -274,6 +274,25 @@ class VentanaPrincipal(QMainWindow):
         self.seg_criterio.cambiado.connect(self._cambio_parametro)
         fila2.addWidget(self.seg_criterio)
 
+        # Estacionalidad: ajusta la venta mensual segun la temporada que va a
+        # cubrir la compra. Se recalcula al instante, sin releer tablas.
+        fila2.addSpacing(16)
+        self.swt_estacionalidad = Interruptor(self.p.estacionalidad)
+        self.swt_estacionalidad.alternado.connect(self._cambio_parametro)
+        fila2.addWidget(self.swt_estacionalidad)
+        etiqueta_estac = QLabel("Considerar temporadas")
+        etiqueta_estac.setStyleSheet(f"color: {estilo.TEXTO_SUAVE};")
+        texto_estac = (
+            "Ajusta la venta mensual segun lo que se vendio historicamente en "
+            "los meses que va a cubrir la compra.\n"
+            "Usa el historial del articulo; si tiene poca venta o menos de "
+            "12 meses, el de su rubro; si tampoco hay, no ajusta.\n"
+            "Necesita que la rotacion se haya recalculado con esta version."
+        )
+        etiqueta_estac.setToolTip(texto_estac)
+        self.swt_estacionalidad.setToolTip(texto_estac)
+        fila2.addWidget(etiqueta_estac)
+
         fila2.addSpacing(16)
         self.btn_recalcular = QPushButton("RECALCULAR ROTACION...")
         self.btn_recalcular.clicked.connect(self.recalcular_rotacion)
@@ -473,6 +492,7 @@ class VentanaPrincipal(QMainWindow):
         self.p.cobertura = self.spn_cobertura.value()
         self.p.criterio_mediana = self.seg_criterio.seleccion() == 1
         self.p.excluir_esporadicos = self.swt_esporadicos.isChecked()
+        self.p.estacionalidad = self.swt_estacionalidad.isChecked()
         self.p.negativo_como_cero = self.chk_neg_cero.isChecked()
         self.p.catalogo_completo = self.chk_catalogo.isChecked()
         self.p.manual_sin_parametros = self.chk_sin_parametros.isChecked()

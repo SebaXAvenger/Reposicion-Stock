@@ -360,6 +360,15 @@ class ModeloDetalle(QAbstractTableModel):
                 f"Venta mensual: {linea.vta_mes:,.2f}  "
                 f"({linea.vta_mes / 30:,.3f} por dia)"
             )
+            # Si la venta se ajusto por temporada, se muestra de donde sale
+            # el numero para que se pueda explicar la cantidad sugerida.
+            if linea.fuente_estacional and linea.indice_estacional > 0:
+                historica = linea.vta_mes / linea.indice_estacional
+                partes.append(
+                    f"Temporada: venta historica {historica:,.2f} x "
+                    f"{linea.indice_estacional:,.2f} "
+                    f"(segun el {linea.fuente_estacional})"
+                )
             partes.append(f"Dias de stock: {linea.dias_stock:,.1f}")
         if linea.modificada:
             partes.append(

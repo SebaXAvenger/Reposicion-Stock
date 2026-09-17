@@ -53,6 +53,9 @@ class Parametros:
     cobertura: int = 45          # spnCober   - comprar stock para N dias
     criterio_mediana: bool = False   # optCriterio 1=promedio 2=mediana
     excluir_esporadicos: bool = True # chkExclEsporad
+    # Ajusta la demanda segun la temporada (ver calculo.indice_estacional).
+    # No existia en el formulario VFP.
+    estacionalidad: bool = True
     negativo_como_cero: bool = False # chkNegCero
     catalogo_completo: bool = False  # chkCatalogoFull
     consolidar_sucursales: bool = False  # optSucursal 1=local 2=todas

@@ -18,7 +18,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .config import Parametros
-from .datos import Catalogo, nombre_proveedor, normalizar_proveedor
+from .datos import (
+    Catalogo, buscar_demanda, nombre_proveedor, normalizar_proveedor,
+)
 from .vfp import vfp_ceiling, vfp_round
 
 MODO_MANUAL = 1
@@ -37,6 +39,37 @@ MOTIVOS = {
     "STOCKMIN": "Stock por encima del minimo",
 }
 
+# ---------------------------------------------------------------------------
+# Estacionalidad
+# ---------------------------------------------------------------------------
+# La demanda mensual (promedio o mediana de la ventana) es un numero PAREJO
+# para todo el anio. El indice estacional la corrige segun lo que se vendio
+# historicamente en los meses que va a cubrir la compra:
+#
+#     indice = venta de los proximos `cobertura` dias segun el perfil
+#              / venta mensual promedio del anio
+#
+#     1,00 = mes normal     1,80 = se vende 80% mas     0,50 = la mitad
+#
+# De donde sale el perfil, en este orden:
+#   1. Del propio articulo, si tiene 12+ meses de historia y vende lo
+#      suficiente como para que el perfil no sea ruido.
+#   2. De su RUBRO (suma de los articulos del rubro con historia completa).
+#   3. Si no hay ninguno de los dos, indice 1: calcula igual que siempre.
+
+# Meses de historia para que esten todos los meses del anio en el perfil
+ESTAC_HISTORIA_MINIMA = 12
+# Perfil propio: unidades por anio y meses con venta minimos
+ESTAC_MIN_UNIDADES_ANIO = 24
+ESTAC_MIN_MESES_CON_VENTA = 6
+# Perfil de rubro: cantidad de articulos y unidades por anio minimas
+ESTAC_RUBRO_MIN_ARTICULOS = 5
+ESTAC_RUBRO_MIN_UNIDADES_ANIO = 60
+# Topes del indice: un pico raro (una obra, un quiebre largo) no puede
+# multiplicar ni anular la compra.
+ESTAC_TOPE_MINIMO = 0.3
+ESTAC_TOPE_MAXIMO = 3.0
+
 
 @dataclass
 class Linea:
@@ -48,7 +81,8 @@ class Linea:
         "stock_total", "vta_mes", "vta_mes_local", "vta_mes_remoto",
         "dias_stock", "cant_pedir", "pedir_local", "pedir_remoto",
         "prop_local", "costo", "subtotal", "ultima_venta", "cod_proveedor",
-        "sugerido_original", "marca", "ubicacion",
+        "sugerido_original", "marca", "ubicacion", "indice_estacional",
+        "fuente_estacional",
     )
 
     clave: str
@@ -77,6 +111,10 @@ class Linea:
     sugerido_original: float
     marca: str
     ubicacion: str
+    # Factor por temporada aplicado a la venta mensual (1 = sin ajuste) y
+    # de donde salio: "articulo", "rubro" o "" (no se ajusto).
+    indice_estacional: float
+    fuente_estacional: str
 
     def fijar_cantidad(self, cantidad: float) -> None:
         """Equivale a grdReposicion.Column8.Text1.Valid.
@@ -167,6 +205,13 @@ class Diagnostico:
     # que engancha, DCC_ARTICU guarda el codigo sin el prefijo de sucursal.
     enganche_clave_completa: int = 0
     enganche_clave_corta: int = 0
+    # Estacionalidad: si estaba pedida, si ROTACION.DBF traia el perfil, y
+    # de donde salio el indice de cada articulo que llego a esa etapa.
+    estacionalidad: bool = False
+    estacionalidad_disponible: bool = False
+    estac_articulo: int = 0
+    estac_rubro: int = 0
+    estac_neutro: int = 0
 
 
 @dataclass
@@ -213,9 +258,17 @@ class Resultado:
 # ---------------------------------------------------------------------------
 
 class MotorReposicion:
-    def __init__(self, parametros: Parametros, catalogo: Catalogo):
+    def __init__(
+        self,
+        parametros: Parametros,
+        catalogo: Catalogo,
+        hoy: datetime.date | None = None,
+    ):
         self.p = parametros
         self.catalogo = catalogo
+        # Fecha desde la que se mide la cobertura para la estacionalidad.
+        # Se puede fijar para las pruebas; en uso normal es hoy.
+        self.hoy = hoy or datetime.date.today()
 
     def calcular(self, modo: int, remoto: bool) -> Resultado:
         import time
@@ -299,7 +352,9 @@ class MotorReposicion:
         diag.venta_hasta = info.hasta
         diag.venta_meses = info.meses
 
-        resultado.leyenda_rotacion = _leyenda_rotacion(info, remoto)
+        resultado.leyenda_rotacion = _leyenda_rotacion(
+            info, remoto, p.estacionalidad
+        )
 
         demanda = catalogo.demanda
         stock_remoto = catalogo.stock_remoto if remoto else {}
@@ -318,6 +373,48 @@ class MotorReposicion:
                 ejemplos.append(Ejemplo(motivo=motivo, **datos))
 
         diag.analizados = len(catalogo.articulos)
+
+        # --- Estacionalidad: preparacion --------------------------------
+        # Solo si esta activada Y la tabla trae el perfil. Con una
+        # ROTACION.DBF vieja el calculo sigue exactamente como antes.
+        usar_estacionalidad = bool(p.estacionalidad and info.con_perfil)
+        diag.estacionalidad = bool(p.estacionalidad)
+        diag.estacionalidad_disponible = bool(info.con_perfil)
+        pesos = pesos_horizonte(self.hoy, int(cobertura))
+        indices_rubro: dict[str, float] = {}
+
+        if usar_estacionalidad:
+            # Perfil de cada rubro = suma de los perfiles de sus articulos
+            # con historia completa. Se suma en unidades, asi que pesan mas
+            # los articulos que mas se venden, que son los mas confiables.
+            suma_rubro: dict[str, list] = {}
+            cuenta_rubro: dict[str, int] = {}
+            for art in catalogo.articulos:
+                if not art.rubro:
+                    continue
+                perfil = perfil_del_universo(buscar_demanda(art, demanda), remoto)
+                if perfil is None:
+                    continue
+                acumulado = suma_rubro.get(art.rubro)
+                if acumulado is None:
+                    suma_rubro[art.rubro] = list(perfil)
+                else:
+                    for m in range(12):
+                        acumulado[m] += perfil[m]
+                cuenta_rubro[art.rubro] = cuenta_rubro.get(art.rubro, 0) + 1
+
+            for rubro, perfil in suma_rubro.items():
+                if (
+                    cuenta_rubro[rubro] >= ESTAC_RUBRO_MIN_ARTICULOS
+                    and sum(perfil) >= ESTAC_RUBRO_MIN_UNIDADES_ANIO
+                ):
+                    indice = indice_estacional(perfil, pesos)
+                    if indice is not None:
+                        indices_rubro[rubro] = indice
+
+        estac_articulo = 0
+        estac_rubro = 0
+        estac_neutro = 0
 
         enganche_completo = 0
         enganche_corto = 0
@@ -376,6 +473,38 @@ class MotorReposicion:
                     ultima_venta=rot.ultima_venta,
                 )
                 continue
+
+            # --- Ajuste por temporada -----------------------------------
+            # Se aplica DESPUES de los filtros de venta (1 a 3), que miran
+            # la historia tal cual, y ANTES del punto de pedido y la
+            # cobertura, que son los que tienen que anticipar la temporada.
+            indice = 1.0
+            fuente = ""
+            if usar_estacionalidad:
+                perfil = perfil_del_universo(rot, remoto)
+                if (
+                    perfil is not None
+                    and sum(perfil) >= ESTAC_MIN_UNIDADES_ANIO
+                    and meses_con >= ESTAC_MIN_MESES_CON_VENTA
+                ):
+                    propio = indice_estacional(perfil, pesos)
+                    if propio is not None:
+                        indice, fuente = propio, "articulo"
+                if not fuente and art.rubro in indices_rubro:
+                    indice, fuente = indices_rubro[art.rubro], "rubro"
+
+                if fuente == "articulo":
+                    estac_articulo += 1
+                elif fuente == "rubro":
+                    estac_rubro += 1
+                else:
+                    estac_neutro += 1
+
+                # El mismo factor para las dos sucursales: la temporada es
+                # la misma y asi no se altera el reparto entre depositos.
+                mes_local *= indice
+                mes_remoto *= indice
+                mes_total = mes_local + mes_remoto
 
             # --- Stock ---------------------------------------------------
             rem = stock_remoto.get(clave, 0.0) if remoto else 0.0
@@ -458,6 +587,8 @@ class MotorReposicion:
                     sugerido_original=necesidad_total,
                     marca=art.marca,
                     ubicacion=art.ubicacion,
+                    indice_estacional=indice,
+                    fuente_estacional=fuente,
                 )
             )
 
@@ -473,6 +604,10 @@ class MotorReposicion:
                             ultima_venta=rot.ultima_venta,
                         )
                     )
+
+        diag.estac_articulo = estac_articulo
+        diag.estac_rubro = estac_rubro
+        diag.estac_neutro = estac_neutro
 
         diag.enganche_clave_completa = enganche_completo
         diag.enganche_clave_corta = enganche_corto
@@ -593,6 +728,9 @@ class MotorReposicion:
                     sugerido_original=sugerido,
                     marca=art.marca,
                     ubicacion=art.ubicacion,
+                    # En modo min/max no hay demanda que ajustar
+                    indice_estacional=1.0,
+                    fuente_estacional="",
                 )
             )
 
@@ -657,7 +795,76 @@ class MotorReposicion:
         resultado.lineas.sort(key=lambda l: (l.cod_proveedor, l.descripcion))
 
 
-def _leyenda_rotacion(info: Any, remoto: bool) -> str:
+def pesos_horizonte(desde: datetime.date, dias: int) -> list[float]:
+    """Que parte de la cobertura cae en cada mes calendario.
+
+    Comprando el 20 de mayo para 45 dias: 12 dias de mayo, 30 de junio y 3
+    de julio. Devuelve 12 pesos (enero..diciembre) que suman 1.
+    """
+    dias = max(int(dias), 1)
+    pesos = [0.0] * 12
+    for desplazamiento in range(dias):
+        fecha = desde + datetime.timedelta(days=desplazamiento)
+        pesos[fecha.month - 1] += 1.0
+    return [peso / dias for peso in pesos]
+
+
+def perfil_del_universo(rot: Any, remoto: bool) -> list | None:
+    """Perfil de 12 meses del articulo en el universo elegido.
+
+    Local: el perfil de esta sucursal. Toda la empresa: la suma de los dos.
+    Devuelve None si el articulo no tiene fila en ROTACION, si la tabla no
+    trae perfil, o si ALGUNA sucursal que vende el articulo tiene menos de
+    12 meses de historia: sumar un perfil completo con uno a medias daria
+    temporadas que no existen.
+    """
+    if rot is None:
+        return None
+
+    origenes = [(rot.perfil_local, rot.historia_local, rot.promedio_local)]
+    if remoto:
+        origenes.append(
+            (rot.perfil_remoto, rot.historia_remota, rot.promedio_remoto)
+        )
+
+    total = None
+    for perfil, historia, promedio in origenes:
+        if perfil is None:
+            if promedio > 0:
+                return None     # vende, pero no hay perfil para esa sucursal
+            continue            # esa sucursal no lo vende: no aporta
+        if historia < ESTAC_HISTORIA_MINIMA:
+            return None
+        total = list(perfil) if total is None else [
+            a + b for a, b in zip(total, perfil)
+        ]
+    return total
+
+
+def indice_estacional(perfil: list, pesos: list[float]) -> float | None:
+    """Factor por temporada para los dias que cubre la compra.
+
+    1. Se suaviza el perfil con el mes anterior y el siguiente (1-2-1), para
+       que un mes suelto con una venta grande no arme una "temporada" y para
+       que la compra se anticipe un poco al arranque de la temporada.
+    2. indice = venta esperada en el horizonte / promedio mensual del anio.
+    3. Se acota entre ESTAC_TOPE_MINIMO y ESTAC_TOPE_MAXIMO.
+
+    Devuelve None si el perfil no tiene venta.
+    """
+    suavizado = [
+        (perfil[m - 1] + 2.0 * perfil[m] + perfil[(m + 1) % 12]) / 4.0
+        for m in range(12)
+    ]
+    anual = sum(suavizado) / 12.0
+    if anual <= 0:
+        return None
+    horizonte = sum(valor * peso for valor, peso in zip(suavizado, pesos))
+    indice = horizonte / anual
+    return min(max(indice, ESTAC_TOPE_MINIMO), ESTAC_TOPE_MAXIMO)
+
+
+def _leyenda_rotacion(info: Any, remoto: bool, estacionalidad: bool = False) -> str:
     from .vfp import dtoc
 
     partes = ["Rotacion al " + (dtoc(info.fecha_calculo) or "?")]
@@ -665,4 +872,9 @@ def _leyenda_rotacion(info: Any, remoto: bool) -> str:
     partes.append(
         "demanda de ambas sucursales" if remoto else "demanda local"
     )
+    if estacionalidad:
+        partes.append(
+            "con temporadas" if info.con_perfil
+            else "temporadas: recalcular rotacion"
+        )
     return "  -  ".join(partes)

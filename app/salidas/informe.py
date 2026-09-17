@@ -103,6 +103,7 @@ def _tarjeta_parametros(diag: Diagnostico, es_rotacion: bool) -> str:
              "Mediana mensual" if diag.mediana else "Promedio mensual"),
             ("Esporadicos",
              "Excluidos" if diag.excluir_esporadicos else "Incluidos"),
+            ("Temporadas", _texto_estacionalidad(diag)),
         ]
     filas += [
         ("Universo de compra",
@@ -292,9 +293,7 @@ def _tarjeta_advertencias(diag, resultado: Resultado) -> str:
         "ningun lado lo que ya se le pidio al proveedor y todavia no llego. "
         "Si hoy se compra y manana se vuelve a abrir esta pantalla, va a "
         "sugerir lo mismo otra vez hasta que la mercaderia entre al stock.",
-        "<b>No sabe de temporadas.</b> Usa el promedio de la ventana analizada "
-        "parejo. Antes de una temporada fuerte conviene subir la cobertura a "
-        "mano.",
+        _advertencia_temporadas(diag),
         "<b>No sabe si el proveedor tiene stock</b> ni cuanto tarda en "
         "entregar.",
     ]
@@ -315,6 +314,35 @@ def _tarjeta_advertencias(diag, resultado: Resultado) -> str:
   <h2>Lo que este analisis NO puede saber</h2>
   <ul>{lista}</ul>
 </div>"""
+
+
+def _texto_estacionalidad(diag) -> str:
+    """Resumen de la estacionalidad para la tarjeta de parametros."""
+    if not diag.estacionalidad:
+        return "No se consideran"
+    if not diag.estacionalidad_disponible:
+        return "Pedidas, pero ROTACION.DBF no trae perfil: recalcular rotacion"
+    return (
+        f"Ajuste propio en {_num(diag.estac_articulo, 0)}, "
+        f"por rubro en {_num(diag.estac_rubro, 0)}, "
+        f"sin datos en {_num(diag.estac_neutro, 0)}"
+    )
+
+
+def _advertencia_temporadas(diag) -> str:
+    """El limite de lo que sabe el calculo sobre temporadas."""
+    if diag.estacionalidad and diag.estacionalidad_disponible:
+        return (
+            "<b>Las temporadas salen del historial.</b> Si un anio hubo un "
+            "quiebre largo o una venta extraordinaria, ese mes queda marcado "
+            "como temporada baja o alta. El ajuste esta acotado, pero conviene "
+            "mirar el detalle de los articulos con cantidades llamativas."
+        )
+    return (
+        "<b>No esta considerando temporadas.</b> Usa el promedio de la ventana "
+        "analizada parejo. Antes de una temporada fuerte conviene activar "
+        "'Considerar temporadas' o subir la cobertura a mano."
+    )
 
 
 def _pie(catalogo) -> str:

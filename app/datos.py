@@ -30,6 +30,9 @@ CAMPOS_ARTICULO = [
     # Informativos: se muestran en el detalle del articulo y salen en el
     # Excel. AR_UBICACI es donde esta fisicamente la mercaderia.
     "AR_MARCA", "AR_UBICACI",
+    # Rubro: agrupa articulos que se venden en la misma temporada. Sirve de
+    # respaldo para la estacionalidad cuando un articulo tiene poca historia.
+    "AR_RUBR",
 ]
 
 CAMPOS_ROTACION = [
@@ -37,6 +40,13 @@ CAMPOS_ROTACION = [
     "ROT_UNIDS", "ROT_ULTVTA", "ROT_FECCAL", "ROT_NEGRO",
     "ROT_DESDE", "ROT_HASTA", "ROT_MESES",
 ]
+
+# Perfil estacional: meses de historia + venta promedio de cada mes
+# calendario. Son OPCIONALES: una ROTACION.DBF generada por el PRG de VFP o
+# por una version anterior no los tiene, y en ese caso el calculo sigue
+# funcionando igual que antes, sin estacionalidad.
+CAMPOS_PERFIL = [f"ROT_EST{m:02d}" for m in range(1, 13)]
+CAMPOS_ROTACION_PERFIL = ["ROT_ESTHIS"] + CAMPOS_PERFIL
 
 # Nombres posibles del campo codigo en PROVEEDO. El formulario original nunca
 # lo nombraba: hacia SEEK contra el tag COD_ALFA del CDX y leia PR_NOMBRE.
@@ -66,6 +76,7 @@ class Articulo:
         "sucursal", "codigo", "clave", "clave_corta", "cod_prov_articulo",
         "descripcion", "unidad", "cod_proveedor_bruto", "desc_proveedor",
         "minimo", "maximo", "stock_local", "costo", "marca", "ubicacion",
+        "rubro",
     )
 
     sucursal: str
@@ -85,6 +96,7 @@ class Articulo:
     costo: float
     marca: str
     ubicacion: str
+    rubro: str
 
 
 @dataclass
@@ -96,7 +108,8 @@ class DemandaArticulo:
     __slots__ = (
         "promedio_local", "promedio_remoto", "mediana_local", "mediana_remota",
         "meses_con_venta_local", "meses_con_venta_remoto", "unidades_totales",
-        "ultima_venta",
+        "ultima_venta", "perfil_local", "perfil_remoto", "historia_local",
+        "historia_remota",
     )
 
     promedio_local: float
@@ -107,6 +120,14 @@ class DemandaArticulo:
     meses_con_venta_remoto: int
     unidades_totales: float
     ultima_venta: Any
+    # Perfil estacional por origen: 12 valores (enero..diciembre) con la
+    # venta promedio de ese mes, o None si ROTACION.DBF no trae el perfil.
+    perfil_local: list | None
+    perfil_remoto: list | None
+    # Meses de historia de cada perfil. Con menos de 12 el perfil esta
+    # incompleto (faltan meses del anio) y no se usa por si solo.
+    historia_local: int
+    historia_remota: int
 
 
 @dataclass
@@ -118,6 +139,9 @@ class InfoRotacion:
     desde: Any = None
     hasta: Any = None
     meses: int = 0
+    # True si la tabla trae el perfil estacional (ROT_EST01..12). Si es
+    # False hay que recalcular la rotacion para poder usar estacionalidad.
+    con_perfil: bool = False
     disponible: bool = False
     mensaje: str = ""
 
@@ -230,6 +254,7 @@ class RepositorioERP:
                         costo=num(fila.get("AR_COST")),
                         marca=alltrim(fila.get("AR_MARCA", "")),
                         ubicacion=alltrim(fila.get("AR_UBICACI", "")),
+                        rubro=alltrim(fila.get("AR_RUBR", "")).upper(),
                     )
                 )
 
@@ -329,7 +354,11 @@ class RepositorioERP:
                 )
                 return
 
+            # El perfil estacional se usa solo si estan TODOS sus campos
+            con_perfil = all(tabla.tiene(c) for c in CAMPOS_ROTACION_PERFIL)
             campos = [c for c in CAMPOS_ROTACION if tabla.tiene(c)]
+            if con_perfil:
+                campos += CAMPOS_ROTACION_PERFIL
             demanda = catalogo.demanda
             fecha_calculo = None
             desde = None
@@ -351,8 +380,16 @@ class RepositorioERP:
 
                 registro = demanda.get(clave)
                 if registro is None:
-                    registro = DemandaArticulo(0.0, 0.0, 0.0, 0.0, 0, 0, 0.0, None)
+                    registro = DemandaArticulo(
+                        0.0, 0.0, 0.0, 0.0, 0, 0, 0.0, None, None, None, 0, 0
+                    )
                     demanda[clave] = registro
+
+                # Perfil de esta fila: 12 valores, enero..diciembre
+                perfil = (
+                    [num(fila.get(c)) for c in CAMPOS_PERFIL] if con_perfil else None
+                )
+                historia = int(num(fila.get("ROT_ESTHIS"))) if con_perfil else 0
 
                 # SUM(IIF(ROT_ORIGE="L", ...)) / MAX(...) agrupado por articulo
                 if origen == "R":
@@ -360,11 +397,27 @@ class RepositorioERP:
                     registro.mediana_remota += mediana
                     if meses_con > registro.meses_con_venta_remoto:
                         registro.meses_con_venta_remoto = meses_con
+                    if perfil is not None:
+                        # Se suma igual que el promedio, por si hubiera mas
+                        # de una fila del mismo articulo y origen.
+                        registro.perfil_remoto = _sumar_perfil(
+                            registro.perfil_remoto, perfil
+                        )
+                        registro.historia_remota = max(
+                            registro.historia_remota, historia
+                        )
                 else:
                     registro.promedio_local += promedio
                     registro.mediana_local += mediana
                     if meses_con > registro.meses_con_venta_local:
                         registro.meses_con_venta_local = meses_con
+                    if perfil is not None:
+                        registro.perfil_local = _sumar_perfil(
+                            registro.perfil_local, perfil
+                        )
+                        registro.historia_local = max(
+                            registro.historia_local, historia
+                        )
 
                 registro.unidades_totales += unidades
                 if ultima and (registro.ultima_venta is None or ultima > registro.ultima_venta):
@@ -395,9 +448,12 @@ class RepositorioERP:
             info.desde = desde
             info.hasta = hasta
             info.meses = meses
+            info.con_perfil = con_perfil
             catalogo.diagnostico.append(
                 f"ROTACION.DBF: {tabla.cantidad_registros:,} filas, "
                 f"{len(demanda):,} articulos con movimiento"
+                + ("" if con_perfil else
+                   " (sin perfil estacional: recalcular la rotacion)")
             )
 
     def _cargar_stock_remoto(self, catalogo: Catalogo) -> None:
@@ -472,6 +528,13 @@ def buscar_demanda(articulo: Articulo, demanda: dict[str, Any]) -> Any:
     if articulo.clave_corta != articulo.clave:
         return demanda.get(articulo.clave_corta)
     return None
+
+
+def _sumar_perfil(acumulado: list | None, perfil: list) -> list:
+    """Suma dos perfiles de 12 meses. Si todavia no habia, copia el nuevo."""
+    if acumulado is None:
+        return list(perfil)
+    return [a + b for a, b in zip(acumulado, perfil)]
 
 
 def normalizar_clave(valor: Any) -> str:

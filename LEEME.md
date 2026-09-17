@@ -227,6 +227,52 @@ Todas deliberadas. Las formulas y los umbrales no se tocaron.
    columna D. Antes de pedir un artículo que figura en negativo conviene ir
    a mirar el estante, y ahora la planilla dice cuál.
 
+10. **Tiene en cuenta las temporadas.** Ver la sección siguiente. Se apaga
+    con el interruptor *Considerar temporadas* y el cálculo vuelve a ser
+    exactamente el del formulario original.
+
+---
+
+## Temporadas (estacionalidad)
+
+El promedio (o la mediana) de ventas es parejo para todo el año. Con
+*Considerar temporadas* activado, la venta mensual se multiplica por un
+**índice estacional** antes de calcular los días de stock y la cantidad a
+pedir:
+
+```
+índice = venta esperada en los próximos `cobertura` días según el perfil
+         / venta mensual promedio del año
+```
+
+**El perfil** se arma al *Recalcular rotación*: `ROTACION.DBF` suma
+`ROT_EST01`..`ROT_EST12` (venta promedio de cada mes calendario) y
+`ROT_ESTHIS` (meses de historia). Van al final de la tabla, así que no se
+mueve ninguna columna que ya existía.
+
+- Los primeros 3 meses de la ventana solo sirven para saber si el artículo
+  ya existía o es nuevo; **no entran al perfil**. El mes que decide tiene
+  venta por definición, y metido en el perfil inflaba ese mes del año en los
+  artículos de poca venta (con ventas parejas, septiembre a noviembre daban
+  el doble).
+- Artículo nuevo: el perfil arranca el mes siguiente a su primera venta.
+- Hacen falta 12 meses de historia, o sea **recalcular con 15 meses o más**
+  (el valor por defecto es 24).
+
+**De dónde sale el índice**, en este orden (`app/calculo.py`, constantes
+`ESTAC_*`):
+
+1. Del propio artículo: 12+ meses de historia, 24+ unidades por año y 6+
+   meses con venta.
+2. De su rubro (`AR_RUBR`): suma de los artículos del rubro con historia
+   completa; mínimo 5 artículos y 60 unidades por año.
+3. Si no, índice 1: calcula igual que siempre.
+
+El perfil se suaviza con el mes anterior y el siguiente (1-2-1), y el
+índice se acota entre 0,3 y 3. Con una `ROTACION.DBF` generada por el PRG
+de VFP o por una versión anterior, el programa calcula sin temporadas y la
+leyenda avisa que hay que recalcular.
+
 ---
 
 ## La clave de proveedor

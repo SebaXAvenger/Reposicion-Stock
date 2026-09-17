@@ -144,6 +144,21 @@ PAGINAS: list[tuple[str, list[tuple[str, str, str]]]] = [
          "una vez y nada mas tiene mediana cero, asi que no se sugiere.\n\n"
          "Empezar con Promedio. Si las cantidades salen exageradas, pasar a "
          "Mediana."),
+        (AMBAR, "Considerar temporadas",
+         "El promedio de ventas es parejo para todo el anio. Con esta opcion "
+         "se corrige segun lo que se vendio historicamente en los dias que va "
+         "a cubrir la compra.\n\n"
+         "Ejemplo:  un articulo vende 10 por mes en promedio, pero en junio y "
+         "julio historicamente vende 18. Comprando a fines de mayo para 45 "
+         "dias, el calculo usa cerca de 18 por mes en vez de 10.\n\n"
+         "De donde sale la temporada:  del propio articulo si tiene al menos "
+         "12 meses de historia y buena venta. Si no, de su rubro. Si tampoco "
+         "hay datos, no ajusta nada.\n\n"
+         "El ajuste esta acotado (entre 0,3 y 3 veces). Pasando el mouse por "
+         "un articulo se ve el factor que se aplico.\n\n"
+         "Necesita que la rotacion se haya recalculado con esta version, con "
+         "24 meses (el valor por defecto). Con menos de 15 meses no alcanza "
+         "para armar las temporadas."),
         (VERDE, "Excluir articulos que vendieron en un solo mes",
          "Deja afuera los articulos que tuvieron movimiento en un unico mes de "
          "los doce analizados.\n\n"
@@ -198,9 +213,10 @@ PAGINAS: list[tuple[str, list[tuple[str, str, str]]]] = [
          "Consecuencia practica:  si hoy se compra y manana se vuelve a abrir "
          "esta pantalla, va a sugerir lo mismo otra vez, hasta que la "
          "mercaderia entre y se cargue en el stock.\n\n"
-         "Tampoco sabe de temporadas. Usa el promedio de los ultimos doce "
-         "meses parejo. Antes de una temporada fuerte conviene subir la "
-         "cobertura a mano.\n\n"
+         "Las temporadas las toma del historial: si un anio hubo un quiebre "
+         "largo o una venta extraordinaria, ese mes puede quedar marcado como "
+         "temporada baja o alta. Con 'Considerar temporadas' apagado, usa el "
+         "promedio parejo.\n\n"
          "Y no sabe si un proveedor tiene el articulo disponible ni cuanto "
          "tarda en entregarlo."),
         (AMBAR, "Si algo no cuadra",

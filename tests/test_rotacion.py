@@ -82,7 +82,9 @@ def _correr(carpeta, opciones=None, **extras):
     parametros = Parametros(
         carpeta_datos=str(carpeta), sucursal="1", **extras
     )
-    return calcular_rotacion(parametros, opciones or OpcionesRotacion(meses=12))
+    opciones = opciones or OpcionesRotacion(meses=12)
+    opciones.hoy = opciones.hoy or HOY
+    return calcular_rotacion(parametros, opciones)
 
 
 def _filas(resultado):
@@ -146,6 +148,84 @@ def test_mediana_con_venta_pareja():
     assert fila["ROT_PROME"] == 10
     assert fila["ROT_MEDIA"] == 10
     assert fila["ROT_MESCON"] == 12
+
+
+def _correr_24(documentos, renglones):
+    return _filas(_correr(_armar(documentos, renglones), OpcionesRotacion(meses=24)))[0]
+
+
+def test_perfil_estacional_por_mes_calendario():
+    """24 meses (ago-2024 a jul-2026): 10 por mes, 40 en junio.
+
+    Los 3 primeros meses son de sondeo y no entran: historia = 21.
+        ROT_EST06 (junio) = 40, el resto = 10
+    """
+    documentos = [_doc(f"D{i}", _mes(i)) for i in range(24)]
+    renglones = [
+        _ren(f"D{i}", 40 if _mes(i).month == 6 else 10) for i in range(24)
+    ]
+    fila = _correr_24(documentos, renglones)
+
+    assert fila["ROT_ESTHIS"] == 21
+    assert fila["ROT_EST06"] == 40
+    assert fila["ROT_EST01"] == 10
+    assert fila["ROT_EST08"] == 10     # agosto: solo 2025, 2024 es sondeo
+
+
+def test_perfil_estacional_con_dos_anios_promedia():
+    """Junio 2025 vendio 20 y junio 2026 vendio 40 -> 30."""
+    documentos = [_doc(f"D{i}", _mes(i)) for i in range(24)]
+    renglones = []
+    for i in range(24):
+        fecha = _mes(i)
+        if fecha.month == 6:
+            cantidad = 40 if fecha.year == 2026 else 20
+        else:
+            cantidad = 5
+        renglones.append(_ren(f"D{i}", cantidad))
+    fila = _correr_24(documentos, renglones)
+
+    assert fila["ROT_EST06"] == 30
+    assert fila["ROT_EST03"] == 5
+
+
+def test_articulo_nuevo_cuenta_historia_desde_la_primera_venta():
+    """Vende solo desde mayo 2026 (los ultimos 3 meses de la ventana).
+
+    Los meses anteriores no son temporada baja: el articulo no existia.
+    Se cuenta desde el mes siguiente a la primera venta (junio), asi que
+    la historia es 2 y el calculo de compra no usa su perfil propio.
+    """
+    documentos = [_doc(f"D{i}", _mes(i)) for i in range(3)]
+    renglones = [_ren(f"D{i}", 10) for i in range(3)]
+    fila = _correr_24(documentos, renglones)
+
+    assert fila["ROT_ESTHIS"] == 2
+    assert fila["ROT_EST07"] == 10
+    assert fila["ROT_EST05"] == 0      # el mes de la primera venta no cuenta
+    assert fila["ROT_EST01"] == 0
+
+
+def test_articulo_existente_con_mes_flojo():
+    """No vendio ningun agosto, pero si en el sondeo: ya existia.
+
+    Agosto queda en cero (temporada baja), no se toma como articulo nuevo.
+    """
+    documentos = [_doc(f"D{i}", _mes(i)) for i in range(24) if _mes(i).month != 8]
+    renglones = [_ren(d["DOC_CLAVE_"], 10) for d in documentos]
+    fila = _correr_24(documentos, renglones)
+
+    assert fila["ROT_ESTHIS"] == 21
+    assert fila["ROT_EST08"] == 0
+    assert fila["ROT_EST09"] == 10
+
+
+def test_ventana_corta_no_alcanza_para_perfil():
+    """Con 12 meses, 3 son de sondeo: quedan 9 y no hay perfil completo."""
+    documentos = [_doc(f"D{i}", _mes(i)) for i in range(12)]
+    renglones = [_ren(f"D{i}", 10) for i in range(12)]
+    fila = _filas(_correr(_armar(documentos, renglones)))[0]
+    assert fila["ROT_ESTHIS"] == 9
 
 
 def test_nota_de_credito_resta():
